@@ -900,4 +900,4 @@ class LSTM(Layer):
         return 1 / (1 + np.exp(-x))
 
 
-__all__ = [FCLayer, Conv2D, FlattenLayer, ActivationLayer, Dropout, BatchNormalization, MaxPooling]
+__all__ = ["FCLayer", "Conv2D", "FlattenLayer", "ActivationLayer", "Dropout", "BatchNormalization", "MaxPooling"]
