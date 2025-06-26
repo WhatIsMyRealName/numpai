@@ -26,6 +26,9 @@ For more information, see:
 - [Python Pickle Risks and Safer Alternatives](https://www.arjancodes.com/blog/python-pickle-module-security-risks-and-safer-alternatives/)  
 - [Safely load a pickle file? – StackExchange](https://security.stackexchange.com/questions/183966/safely-load-a-pickle-file)
 
+## See also
+[This project](https://pypi.org/project/npnet/) is quite the same. But mine is better 😎.
+
 ## License
 
 GNU AGPLv3 License. See `LICENSE` file for details.
