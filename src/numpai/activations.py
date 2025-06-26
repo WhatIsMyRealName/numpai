@@ -88,4 +88,4 @@ def softmax_prime(x: np.ndarray, dL_dS: np.ndarray) -> np.ndarray:
     return dL_dX
 
 
-__all__ = [tanh, tanh_prime, relu, relu_prime, leakyrelu, leakyrelu_prime, gelu_approx2, gelu_approx2_prime,swish, swish_prime, softmax, softmax_prime, softmax_prime_approx]
+__all__ = ["tanh", "tanh_prime", "relu", "relu_prime", "leakyrelu", "leakyrelu_prime", "gelu_approx2", "gelu_approx2_prime", "swish", "swish_prime", "softmax", "softmax_prime", "softmax_prime_approx"]
