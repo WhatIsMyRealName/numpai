@@ -1,516 +1,364 @@
-from __future__ import annotations # type hinting
-# To load/save model
+from __future__ import annotations
+
+import copy
 import pickle
-
-# For fit2() and fit3()
-import os
-# This is for display only
-import sys
-from math import ceil
-
-# For summary() and fit()
-# For deprecation warnings (fit)
 import warnings
-# For summary() and export() (export not implemented yet)
-import matplotlib.pyplot as plt
-from layers import Layer, FCLayer, Conv2D, BatchNormalization, Dropout, FlattenLayer, MaxPooling, ActivationLayer, GlobalAvgPool2D
-
-# For type hinting (not necessary)
-import numpy as np # Note that `numpy` is already imported by `layer` and that you realy need it.
-from typing import Type
+from collections.abc import Callable, Sequence
+from math import ceil
 from pathlib import Path
 
-# TODO : use try/except for optionals dependancies and allow methods to run without
+import matplotlib.pyplot as plt
+import numpy as np
+
+from .layers import (
+    ActivationLayer,
+    BatchNormalization,
+    Conv2D,
+    Dropout,
+    Embedding,
+    FCLayer,
+    FlattenLayer,
+    GlobalAvgPool2D,
+    LSTM,
+    Layer,
+    MaxPooling,
+)
+
+LossFunction = Callable[[np.ndarray, np.ndarray], float | np.float64]
+LossPrimeFunction = Callable[[np.ndarray, np.ndarray], np.ndarray]
+
 
 class Network:
-    """
-    Classe représentant un réseau de neurones.
-        
-    Methods
-    ----------
-    add : Ajoute une couche au réseau.
-    use : Définit la fonction d'erreur.
-    predict : Faire une prédiction.
-    fit - deprecated : Entraîne le réseau.
-    fit2 : Entraîne le réseau.
-    summary : Résumé du réseau.
-    save : Enregistre le réseau.
-    load - staticmethod : Charge un réseau.
-    
-    Attributes
-    ----------
-    layers : list
-    loss : function
-    loss_prime : function
-    logs : list
-    training_data : dict
-    """
-    def __init__(self):
-        self.layers = []
-        self.loss = None
-        self.loss_prime = None
-        self.logs = []  # erreur
-        self.logs_test = []   # erreur de validation
-        self.training_data = {"X": [], "y": []} # pour stocker des données d'entraînement lors de son utilisation dans un autre programme
+    def __init__(self) -> None:
+        self.layers: list[Layer] = []
+        self.loss: LossFunction | None = None
+        self.loss_prime: LossPrimeFunction | None = None
+        self.logs: list[float] = []
+        self.logs_test: list[float] = []
+        self.training_data: dict[str, list[np.ndarray]] = {"X": [], "y": []}
+        self._inference_only = False
 
-    def add(self, layer: Type[Layer]) -> None:
+    def add(self, layer: Layer) -> None:
+        self._ensure_training_enabled()
+        if not isinstance(layer, Layer):
+            raise TypeError(f"layer doit heriter de Layer, recu {type(layer).__name__}")
         self.layers.append(layer)
 
-    def use(self, loss: function, loss_prime: function) -> None:
-        """
-        Permet de définir la fonction d'erreur utilisée par le réseau.
-
-        Parameters
-        ----------
-        loss : function
-            Fonction d'erreur.
-        loss_prime : function
-            Dérivée de la fonction d'erreur.
-        """
+    def use(self, loss: LossFunction, loss_prime: LossPrimeFunction) -> None:
+        self._ensure_training_enabled()
         self.loss = loss
         self.loss_prime = loss_prime
 
-    def predict(self, input_data: list|np.ndarray) -> list:
-        """
-        Permet l'inférence du modèle sur les données passées en argument.
+    def predict(self, input_data: Sequence[np.ndarray] | np.ndarray) -> list[np.ndarray]:
+        return [self._forward(sample, training=False) for sample in input_data]
 
-        Parameters
-        ----------
-        input_data : list | np.ndarray
-            Liste des objets sur lesquels inférer. Eventuellement une liste à 1 élément.
-
-        Returns
-        -------
-        list
-            liste des résultats pour chaque objet d'entrée.
-        """
-        samples = len(input_data)
-        result = []
-        for i in range(samples):
-            output = input_data[i]
-            for layer in self.layers:
-                output = layer.forward_propagation(output, training=False)
-            result.append(output)
-
-        return result
-
-    def fit(self, x_train: list|np.ndarray, y_train: list|np.ndarray, epochs: int, learning_rate: float) -> None:
-        
-        warnings.warn(f"""\033[93m\n[WARNING] 'fit' est déprécié et pourrait être supprimé dans les prochaines versions. Utilisez fit2 à la place.\033[0m""", DeprecationWarning)
+    def fit(
+        self,
+        x_train: Sequence[np.ndarray] | np.ndarray,
+        y_train: Sequence[np.ndarray] | np.ndarray,
+        epochs: int,
+        learning_rate: float,
+    ) -> None:
+        self._warn_deprecated("fit", "fit3")
+        self._ensure_training_ready(epochs=epochs, learning_rate=learning_rate)
 
         samples = len(x_train)
-        initial_learning_rate = learning_rate
-        decay = 0.001
-        for i in range(epochs):
-            err = 0
-            for j in range(samples):
-                sys.stdout.write(f"\rforward propagation... {j+1}/{samples}")
-                sys.stdout.flush()
-                output = x_train[j]
-                for layer in self.layers:
-                    output = layer.forward_propagation(output)
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            for sample_index in range(samples):
+                output = self._forward(x_train[sample_index], training=True)
+                epoch_loss += float(self.loss(y_train[sample_index], output))
+                error = self.loss_prime(y_train[sample_index], output)
+                self._backward(error, learning_rate, epoch)
 
-                # compute loss (for display purpose only)
-                err += self.loss(y_train[j], output)
+            epoch_loss /= samples
+            print(f"epoch {epoch + 1}/{epochs} error={epoch_loss:.6f}")
 
-                sys.stdout.write(f"\backward propagation... {j+1}/{samples}   ")
-                sys.stdout.flush()
-                learning_rate = initial_learning_rate / (1 + decay * i)
-                error = self.loss_prime(y_train[j], output)
-                # print(output, y_train[j], error)
-                for layer in reversed(self.layers):
-                    error = layer.backward_propagation(error, learning_rate, i)
+    def fit2(
+        self,
+        x_train: Sequence[np.ndarray] | np.ndarray,
+        y_train: Sequence[np.ndarray] | np.ndarray,
+        epochs: int,
+        learning_rate: float,
+        batch_size: int = 32,
+    ) -> None:
+        self._warn_deprecated("fit2", "fit3")
+        self._ensure_training_ready(epochs=epochs, learning_rate=learning_rate, batch_size=batch_size)
 
-            # calculate average error on all samples
-            err /= samples
-            sys.stdout.write('\r')
-            print('epoch %d/%d              error=%f' % (i+1, epochs, err))
+        for epoch in range(epochs):
+            epoch_loss = self._train_epoch(x_train, y_train, learning_rate, batch_size, epoch)
+            self.logs.append(epoch_loss)
+            print(f"epoch {epoch + 1}/{epochs} error={epoch_loss:.6f}")
 
-    def fit2(self, x_train: list|np.ndarray, y_train: list|np.ndarray, epochs: int, learning_rate: float, batch_size: int=32) -> None:
-        """
-        Permet d'entraîner le modèle
+    def fit3(
+        self,
+        x_train: Sequence[np.ndarray] | np.ndarray,
+        y_train: Sequence[np.ndarray] | np.ndarray,
+        x_val: Sequence[np.ndarray] | np.ndarray,
+        y_val: Sequence[np.ndarray] | np.ndarray,
+        epochs: int,
+        learning_rate: float,
+        batch_size: int = 32,
+        patience_lr_decay: int = 2,
+        patience_early_stopping: int = 5,
+        min_lr: float = 1e-5,
+    ) -> None:
+        self._ensure_training_ready(epochs=epochs, learning_rate=learning_rate, batch_size=batch_size)
+        if patience_lr_decay <= 0:
+            raise ValueError("patience_lr_decay doit etre strictement positif")
+        if patience_early_stopping <= 0:
+            raise ValueError("patience_early_stopping doit etre strictement positif")
+        if min_lr <= 0:
+            raise ValueError("min_lr doit etre strictement positif")
 
-        Parameters
-        ----------
-        x_train : list | np.ndarray
-            Liste des données d'entraînement.
-        y_train : list | np.ndarray
-            Liste des sorties attendues pour chaque entrée.
-        epochs : int
-            Nombre d'itérations sur les données.
-        learning_rate : float
-            Taux d'apprentissage du modèle.
-        batch_size : int, optional
-            Nombre de données traitées d'un coup, by default 32.
-        """
-        samples = len(x_train)
-        initial_learning_rate = learning_rate
-        decay = 0.001
-        for i in range(epochs):
-            err = 0.
-            for j in range(0, samples, batch_size):
-                # Sélection du mini-lot
-                x_batch = x_train[j:j+batch_size]
-                y_batch = y_train[j:j+batch_size]
-                sys.stdout.write(f"\rforward propagation... {j/batch_size +1}/{ceil(samples/batch_size)}   ")
-                sys.stdout.flush()
+        best_val_loss = float("inf")
+        best_layers = copy.deepcopy(self.layers)
+        epochs_without_improvement = 0
+        epochs_without_lr_decay = 0
 
-                # Propagation avant
-                output = x_batch
-                for layer in self.layers:
-                    output = layer.forward_propagation(output)
+        for epoch in range(epochs):
+            train_loss = self._train_epoch(x_train, y_train, learning_rate, batch_size, epoch)
+            val_loss = self._validation_loss(x_val, y_val)
+            self.logs.append(train_loss)
+            self.logs_test.append(val_loss)
 
-                # Calcul de la perte pour le mini-lot
-                # batch_loss = [self.loss(y_batch[k], output[k]) for k in range(len(y_batch))]
-                batch_loss = self.loss(y_batch, output)
-                err += batch_loss
+            print(f"epoch {epoch + 1}/{epochs} train_error={train_loss:.6f} val_error={val_loss:.6f}")
 
-                # Rétropropagation pour le mini-lot
-                learning_rate = initial_learning_rate # / (1 + decay * i) # faut voir, c'est déjà pris en compte par Adam ou pas ?
-                sys.stdout.write(f"\rbackward propagation... {j/batch_size +1}/{ceil(samples/batch_size)}")
-                sys.stdout.flush()
-                # batch_error = np.array([self.loss_prime(y_batch[k], output[k]) for k in range(len(y_batch))])
-                batch_error = self.loss_prime(y_batch, output)
-                # print(output, y_batch, batch_error)
-                for layer in reversed(self.layers):
-                    batch_error = layer.backward_propagation(batch_error, learning_rate, i)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_layers = copy.deepcopy(self.layers)
+                epochs_without_improvement = 0
+                epochs_without_lr_decay = 0
+                continue
 
-            # Calcul de la perte moyenne pour cette époque
-            err /= samples
-            sys.stdout.write('\r')
-            print('epoch %d/%d                    error=%f' % (i+1, epochs, err))
-            self.logs.append(err)
+            epochs_without_improvement += 1
+            epochs_without_lr_decay += 1
 
-    def fit3(self,
-            x_train: list|np.ndarray,
-            y_train: list|np.ndarray,
-            x_val: list|np.ndarray,
-            y_val: list|np.ndarray,
-            epochs: int,
-            learning_rate: float,
-            batch_size: int = 32,
-            patience_lr_decay: int = 2,
-            patience_early_stopping: int = 5,
-            min_lr: float = 1e-5) -> None:
-        """
-        Entraîne le modèle avec validation et early stopping.
+            if epochs_without_lr_decay >= patience_lr_decay and learning_rate > min_lr:
+                learning_rate = max(learning_rate * 0.5, min_lr)
+                print(f"Nouveau learning rate : {learning_rate:.1e}")
+                epochs_without_lr_decay = 0
 
-        Parameters
-        ----------
-        x_train : list | np.ndarray
-            Données d'entraînement.
-        y_train : list | np.ndarray
-            Étiquettes d'entraînement.
-        x_val : list | np.ndarray
-            Données de validation.
-        y_val : list | np.ndarray
-            Étiquettes de validation.
-        epochs : int
-            Nombre d'époques d'entraînement.
-        learning_rate : float
-            Taux d'apprentissage initial.
-        batch_size : int, optional
-            Taille des mini-lots, par défaut 32.
-        patience : int, optional
-            Nombre d'époques sans amélioration avant arrêt, par défaut 5.
+            if epochs_without_improvement >= patience_early_stopping:
+                print(
+                    f"Arret precoce apres {epoch + 1} epoques "
+                    f"(patience={patience_early_stopping})."
+                )
+                break
 
-        Return
-        --------
-        Network
-            Meilleur modèle lors de l'entraînement
-        """
-        samples = len(x_train)
-        decay = 0.001
-
-        best_val_err = float('inf')
-        wait_stop = 0
-        wait_lr = 0
-
-        for epoch in range(1, epochs + 1):
-            epoch_err = 0.0
-
-            # --- Phase d'entraînement ---
-            for j in range(0, samples, batch_size):
-                x_batch = x_train[j:j+batch_size]
-                y_batch = y_train[j:j+batch_size]
-                sys.stdout.write(f"\rforward propagation... {int(j/batch_size) +1}/{ceil(samples/batch_size)}   ")
-                sys.stdout.flush()
-
-                # Propagation avant
-                output = x_batch
-                for layer in self.layers:
-                    output = layer.forward_propagation(output)
-
-                # Calcul de la perte
-                batch_loss = self.loss(y_batch, output)
-                epoch_err += batch_loss
-
-                sys.stdout.write(f"\rbackward propagation... {int(j/batch_size) +1}/{ceil(samples/batch_size)}")
-                sys.stdout.flush()
-                # Rétropropagation
-                # lr = learning_rate / (1 + decay * epoch)
-                error_batch = self.loss_prime(y_batch, output)
-                for layer in reversed(self.layers):
-                    error_batch = layer.backward_propagation(error_batch, learning_rate, epoch - 1)
-
-            # Moyenne de la perte d'entraînement
-            train_err = epoch_err / samples
-            self.logs.append(train_err)
-
-            # --- Phase de validation ---
-            # Propagation avant sur données de validation
-            val_output = self.predict(x_val)
-            val_err = self.loss(y_val, val_output) / len(x_val)
-            self.logs_test.append(val_err)
-
-            # Affichage
-            sys.stdout.write('\r')
-            print(f"Epoch {epoch}/{epochs} - train_error={train_err:.6f} - val_error={val_err:.6f}")
-
-
-            # Early stopping et sauvegarde du meilleur modèle
-            if val_err < best_val_err:
-                best_val_err = val_err
-                wait_stop = 0
-                wait_lr = 0
-                self.save("_tmp_model_file.pkl", debug=False)
-            else:
-                wait_stop += 1
-                wait_lr += 1
-                # Scheduler LR
-                if wait_lr >= patience_lr_decay and learning_rate > min_lr:
-                    learning_rate = max(learning_rate * 0.5, min_lr)
-                    print(f"Nouveau learning rate : {learning_rate:.1e}")
-                    wait_lr = 0
-                # Early stopping
-                if wait_stop >= patience_early_stopping:
-                    print(f"Arrêt précoce après {epoch} époques (patience={patience_early_stopping}).")
-                    break
-
-        # Charger le meilleur modèle
-        best_model = self.__class__.load("_tmp_model_file.pkl", debug=False)
-        os.remove("_tmp_model_file.pkl")
-        # Remplacer uniquement les poids/layers pour conserver logs complets
-        self.layers = best_model.layers
+        self.layers = best_layers
 
     def summary(self) -> None:
-        """
-        Affiche un résumé du modèle.
-        """
-        print("\n\nModel Summary:\n")
+        print("\nModel Summary:\n")
         total_params = 0
-        for i, layer in enumerate(self.layers):
-            layer_type = type(layer).__name__
-
-            # Calcul de la forme de sortie pour les couches Conv2D
-            if isinstance(layer, Conv2D):
-                # Extraction des paramètres de la couche Conv2D
-                input_height, input_width = layer.input_shape[1], layer.input_shape[2]
-                filter_height, filter_width = layer.filters.shape[2], layer.filters.shape[3]
-                stride = layer.stride
-                padding = layer.padding  # Padding est un entier
-                
-                # Calcul de la taille de sortie pour chaque dimension
-                output_height = (input_height - filter_height + 2 * padding) // stride + 1
-                output_width = (input_width - filter_width + 2 * padding) // stride + 1
-                
-                output_shape = (layer.num_filters, output_height, output_width)
-            
-            elif isinstance(layer, FCLayer):
-                output_shape = (layer.biases.shape[1],)
-            else:
-                output_shape = getattr(layer, 'output_size', None)
-                if output_shape is None:
-                   output_shape = getattr(layer, 'input_size', None)
-                   if output_shape is None:
-                    output_shape = "N/A"
-
-            # Compte des paramètres pour la couche actuelle
-            params_count = 0
-
-            # Pour les couches Conv2D
-            if isinstance(layer, Conv2D):
-                filter_size = layer.filters.shape[2] * layer.filters.shape[3]  # filtre (height * width)
-                in_channels = layer.input_shape[0]  # canaux d'entrée
-                params_count += (filter_size * in_channels + 1) * layer.num_filters  # (filtres * in_channels + biais)
-
-            # Pour les couches Fully Connected (Dense)
-            if hasattr(layer, 'weights'):
-                params_count += layer.weights.size  # Nombre d'éléments dans les poids
-            if hasattr(layer, 'bias'):
-                params_count += layer.bias.size  # Nombre d'éléments dans les biais
-            
-            # Pour les couches BatchNormalization
-            if isinstance(layer, BatchNormalization):
-                params_count += 2 * layer.input_size[0] if isinstance(layer.input_size, tuple) else 2 * layer.input_size
-
+        for index, layer in enumerate(self.layers, start=1):
+            output_shape = self._layer_output_shape(layer)
+            params_count = self._layer_parameter_count(layer)
             total_params += params_count
-
-            print(f"Layer {i + 1}: {layer_type} | Output Shape: {output_shape} | Parameters: {params_count}")
+            print(
+                f"Layer {index}: {type(layer).__name__} | "
+                f"Output Shape: {output_shape} | Parameters: {params_count}"
+            )
 
         print(f"Total Parameters: {total_params}")
-        if self.logs:
-            plt.plot(self.logs, marker='o', linestyle='-', color='b', label='Erreur')
-            plt.plot(self.logs_test, marker='o', linestyle='-', color='r', label='Erreur de validation')
+        logs = getattr(self, "logs", [])
+        logs_test = getattr(self, "logs_test", [])
+        if logs:
+            plt.plot(logs, marker="o", linestyle="-", color="b", label="Erreur")
+            if logs_test:
+                plt.plot(logs_test, marker="o", linestyle="-", color="r", label="Erreur de validation")
             plt.title("Erreur au cours du temps (epochs)", fontsize=14)
             plt.xlabel("Epoch", fontsize=12)
             plt.ylabel("Erreur (UA)", fontsize=12)
             plt.grid(True)
             plt.legend(loc="best")
             plt.show()
-    
-    # Save the model to a file
-    def save(self, filename: str|Path, debug=True) -> None:
-        """
-        Permet d'enregistrer le modèle.
-        NOTE : On peut toujours entraîner un modèle qui a été sauvegardé par cette méthode.
 
-        Parameters
-        ----------
-        filename : str | Path
-            Nom du fichier où sera stocké le modèle. Peut contenir un chemin absolu ou relatif.
-        """
-        with open(filename, 'wb') as file:
+    def save(self, filename: str | Path, debug: bool = True) -> None:
+        path = Path(filename)
+        with path.open("wb") as file:
             pickle.dump(self, file)
-        if debug: print(f"Model saved to {filename}")
+        if debug:
+            print(f"Model saved to {path}")
 
-    # Load the model from a file
     @staticmethod
-    def load(filename: str|Path, debug=True) -> Network:
-        """
-        Permet de charger un modèle
-
-        Parameters
-        ----------
-        filename : str | Path
-            Nom du fichier où est stocké le modèle.
-
-        Returns
-        -------
-        Network
-            Le modèle.
-        """
-        with open(filename, 'rb') as file:
+    def load(filename: str | Path, debug: bool = True) -> Network:
+        path = Path(filename)
+        with path.open("rb") as file:
             model = pickle.load(file)
-        if debug: print(f"Model loaded from {filename}")
+        if not isinstance(model, Network):
+            raise TypeError(f"Le fichier {path} ne contient pas un Network")
+        if debug:
+            print(f"Model loaded from {path}")
         return model
 
-
-
-
-
-
-
-
-
-    # En développement
     def export(self) -> None:
-        """
-        Export optimized model for inference.
-
-        Removes training-specific layers and parameters, and fuses
-        BatchNormalization into preceding layers for faster inference.
-
-        Parameters
-        ----------
-        self : Network
-            Neural network instance to be exported for inference.
-
-        Returns
-        -------
-        None
-
-        Notes
-        -----
-        - Dropout layers are removed entirely.
-        - BatchNormalization parameters (gamma, beta, running mean/var)
-          are fused into preceding Conv2D or FCLayer weights and biases:
-
-            Given input x to BN layer:
-                y = gamma * (x - mean) / sqrt(var + eps) + beta
-
-            For a linear layer z = W x + b, substituting x from BN:
-                z = W [(x - mean) / sqrt(var + eps) * gamma] + W[beta] + b
-
-            So:
-            - W_new = W * (gamma / sqrt(var + eps))
-            - b_new = (b - mean) * (gamma / sqrt(var + eps)) + beta
-
-        - Training-only methods (`fit`, `fit2`, `fit3`) and attributes
-          (`loss`, `loss_prime`, `logs`, `logs_test`, `training_data`) are deleted.
-        - Optimizer moment parameters in FCLayer (Adam: m_weights, v_weights,
-          m_biases, v_biases, beta1, beta2, epsilon, t) are removed.
-        - Sets `_inference_only` to True
-          TODO: ensure `_inference_only` is initialized to False in `__init__`.
-        """
-        fused_layers = []
+        fused_layers: list[Layer] = []
         for layer in self.layers:
-            # Remove Dropout layers
             if isinstance(layer, Dropout):
                 continue
 
-            # Fuse BatchNormalization into previous layer
             if isinstance(layer, BatchNormalization) and fused_layers:
-                prev = fused_layers[-1]
+                previous_layer = fused_layers[-1]
+                if isinstance(previous_layer, FCLayer):
+                    self._fuse_batchnorm_into_fc(previous_layer, layer)
+                    continue
+                if isinstance(previous_layer, Conv2D):
+                    self._fuse_batchnorm_into_conv(previous_layer, layer)
+                    continue
 
-                # BN params
-                gamma = layer.gamma            # scale parameter
-                beta = layer.beta              # shift parameter
-                mean = getattr(layer, 'mean', layer.running_mean)
-                var = getattr(layer, 'variance', layer.running_var)
-                eps = layer.epsilon
-
-                # Compute scale = gamma / sqrt(var + eps)
-                if isinstance(prev, FCLayer):
-                    scale = gamma.flatten() / np.sqrt(var.flatten() + eps)
-                    prev.weights *= scale[np.newaxis, :]
-                    prev.biases = (prev.biases - mean.flatten()) * scale + beta.flatten()
-
-                elif isinstance(prev, Conv2D):
-                    scale = gamma.reshape(prev.filters.shape[0], 1, 1, 1) / \
-                            np.sqrt(var.reshape(prev.filters.shape[0], 1, 1, 1) + eps)
-                    prev.filters *= scale
-                    prev.biases = (prev.biases - mean.reshape(prev.biases.shape)) * \
-                                  scale.reshape(prev.biases.shape) + beta.reshape(prev.biases.shape)
-
-                continue
-
-            # Strip Adam optimizer parameters from FCLayer (training only)
             if isinstance(layer, FCLayer):
-                for attr in ['m_weights', 'v_weights', 'm_biases', 'v_biases',
-                            'beta1', 'beta2', 'epsilon', 't']:
-                    if hasattr(layer, attr):
-                        delattr(layer, attr)
+                self._strip_fc_optimizer_state(layer)
 
             fused_layers.append(layer)
 
-        # Assign optimized layers
         self.layers = fused_layers
-
-        # Delete training methods
-        for method in ['fit', 'fit2', 'fit3']:
-            if hasattr(self, method):
-                delattr(self, method)
-
-        # Delete training attributes
-        for attr in ['loss', 'loss_prime', 'logs', 'logs_test', 'training_data']:
+        for attr in ("loss", "loss_prime", "logs", "logs_test", "training_data"):
             if hasattr(self, attr):
                 delattr(self, attr)
-
-        # Mark as inference-only
         self._inference_only = True
 
-    def export_to_onnx(self, filepath: str, input_shape: tuple) -> None:
+    def _forward(self, input_data: np.ndarray, training: bool) -> np.ndarray:
+        output = input_data
+        for layer in self.layers:
+            output = layer.forward_propagation(output, training=training)
+        return output
+
+    def _backward(self, error: np.ndarray, learning_rate: float, epoch: int) -> np.ndarray | None:
+        for layer in reversed(self.layers):
+            error = layer.backward_propagation(error, learning_rate, epoch)
+        return error
+
+    def _train_epoch(
+        self,
+        x_train: Sequence[np.ndarray] | np.ndarray,
+        y_train: Sequence[np.ndarray] | np.ndarray,
+        learning_rate: float,
+        batch_size: int,
+        epoch: int,
+    ) -> float:
+        samples = len(x_train)
+        epoch_loss = 0.0
+        batches = ceil(samples / batch_size)
+
+        for batch_index, batch_start in enumerate(range(0, samples, batch_size), start=1):
+            batch_end = batch_start + batch_size
+            x_batch = x_train[batch_start:batch_end]
+            y_batch = y_train[batch_start:batch_end]
+
+            output = self._forward(x_batch, training=True)
+            epoch_loss += float(self.loss(y_batch, output))
+            batch_error = self.loss_prime(y_batch, output)
+            self._backward(batch_error, learning_rate, epoch)
+
+            print(f"\rtraining batch {batch_index}/{batches}", end="")
+
+        print("\r", end="")
+        return epoch_loss / samples
+
+    def _validation_loss(
+        self,
+        x_val: Sequence[np.ndarray] | np.ndarray,
+        y_val: Sequence[np.ndarray] | np.ndarray,
+    ) -> float:
+        val_output = np.asarray(self.predict(x_val))
+        return float(self.loss(np.asarray(y_val), val_output)) / len(x_val)
+
+    def _ensure_training_ready(
+        self,
+        epochs: int,
+        learning_rate: float,
+        batch_size: int | None = None,
+    ) -> None:
+        self._ensure_training_enabled()
+        self._ensure_loss_configured()
+        if epochs <= 0:
+            raise ValueError("epochs doit etre strictement positif")
+        if learning_rate <= 0:
+            raise ValueError("learning_rate doit etre strictement positif")
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError("batch_size doit etre strictement positif")
+
+    def _ensure_training_enabled(self) -> None:
+        if self._inference_only:
+            raise RuntimeError("Ce Network a ete exporte pour l'inference et ne peut plus etre entraine.")
+
+    def _ensure_loss_configured(self) -> None:
+        if self.loss is None or self.loss_prime is None:
+            raise ValueError("Appelez use(loss, loss_prime) avant l'entrainement.")
+
+    def _warn_deprecated(self, method_name: str, replacement: str) -> None:
+        warnings.warn(
+            f"'{method_name}' est deprecie et sera supprime. Utilisez '{replacement}' a la place.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    def _layer_output_shape(self, layer: Layer) -> tuple[int, ...] | str | int:
+        if isinstance(layer, Conv2D):
+            input_height, input_width = layer.input_shape[1], layer.input_shape[2]
+            filter_height, filter_width = layer.filters.shape[2], layer.filters.shape[3]
+            output_height = (input_height - filter_height + 2 * layer.padding) // layer.stride + 1
+            output_width = (input_width - filter_width + 2 * layer.padding) // layer.stride + 1
+            return (layer.num_filters, output_height, output_width)
+        if isinstance(layer, FCLayer):
+            return (layer.biases.shape[1],)
+        if isinstance(layer, BatchNormalization):
+            return layer.input_size
+        return getattr(layer, "output_size", "N/A")
+
+    def _layer_parameter_count(self, layer: Layer) -> int:
+        if isinstance(layer, Conv2D):
+            return int(layer.filters.size + layer.biases.size)
+        if isinstance(layer, FCLayer):
+            return int(layer.weights.size + layer.biases.size)
+        if isinstance(layer, BatchNormalization):
+            return int(layer.gamma.size + layer.beta.size)
+
+        params_count = 0
+        for attr in ("weights", "biases", "embeddings", "W", "b", "gamma", "beta"):
+            value = getattr(layer, attr, None)
+            if isinstance(value, np.ndarray):
+                params_count += int(value.size)
+        return params_count
+
+    def _fuse_batchnorm_into_fc(self, layer: FCLayer, batchnorm: BatchNormalization) -> None:
+        mean = batchnorm.running_mean.flatten()
+        variance = batchnorm.running_var.flatten()
+        gamma = batchnorm.gamma.flatten()
+        beta = batchnorm.beta.flatten()
+        scale = gamma / np.sqrt(variance + batchnorm.epsilon)
+
+        layer.weights *= scale[np.newaxis, :]
+        layer.biases = (layer.biases - mean) * scale + beta
+
+    def _fuse_batchnorm_into_conv(self, layer: Conv2D, batchnorm: BatchNormalization) -> None:
+        filters_count = layer.filters.shape[0]
+        mean = batchnorm.running_mean.reshape(filters_count, 1, 1)
+        variance = batchnorm.running_var.reshape(filters_count, 1, 1)
+        gamma = batchnorm.gamma.reshape(filters_count, 1, 1)
+        beta = batchnorm.beta.reshape(filters_count, 1, 1)
+        scale = gamma / np.sqrt(variance + batchnorm.epsilon)
+
+        layer.filters *= scale[:, np.newaxis, :, :]
+        layer.biases = (layer.biases - mean) * scale + beta
+
+    def _strip_fc_optimizer_state(self, layer: FCLayer) -> None:
+        for attr in ("m_weights", "v_weights", "m_biases", "v_biases", "beta1", "beta2", "epsilon", "t"):
+            if hasattr(layer, attr):
+                delattr(layer, attr)
+
+    def export_to_onnx(self, filepath: str | Path, input_shape: tuple[int | None, ...]) -> None:
         """
         Export the inference-optimized network to ONNX format.
 
         Parameters
         ----------
         filepath : str
-            Path to save the .onnx model file. Utilisé par `onnx.save`.
+            Path to save the .onnx model file. Utilise par `onnx.save`.
         input_shape : tuple of int
-            Shape of the input tensor, e.g., (batch_size, channels, height, width). 
-            Passé à `helper.make_tensor_value_info` pour définir la signature.
+            Shape of the input tensor, e.g., (batch_size, channels, height, width).
+            Passe a `helper.make_tensor_value_info` pour definir la signature.
 
         Returns
         -------
@@ -523,104 +371,256 @@ class Network:
         - ActivationLayer -> op (Relu, Tanh, Sigmoid, etc.) via mapping explicite
         """
         import onnx
-        from onnx import helper, TensorProto
+        from onnx import TensorProto, helper
+
         nodes = []
         initializers = []
+        input_name = "input"
+        previous_output = input_name
+        current_shape = list(input_shape)
 
-        # 1) Définition de l'entrée
-        # helper.make_tensor_value_info(name, elem_type, shape)
-        input_tensor = helper.make_tensor_value_info(
-            'input', TensorProto.FLOAT, list(input_shape)
-        )
-        prev_output = 'input'
+        input_tensor = helper.make_tensor_value_info(input_name, TensorProto.FLOAT, self._onnx_shape(input_shape))
 
-        # Mapping des activations Python vers ONNX
-        act_map = {
-            'relu': 'Relu',
-            'tanh': 'Tanh',
-            'sigmoid': 'Sigmoid',
-            'leakyrelu': 'LeakyRelu'
-            # ajouter d'autres si nécessaire
-        }
-
-        # 2) Parcours des couches optimisées
-        for idx, layer in enumerate(self.layers):
-            # 2.a Conv2D -> Conv
+        for index, layer in enumerate(self.layers):
             if isinstance(layer, Conv2D):
-                W_name = f'conv{idx}_W'
-                B_name = f'conv{idx}_B'
-                # Crée et ajoute les tenseurs de poids et biais
-                initializers.append(helper.make_tensor(
-                    W_name, TensorProto.FLOAT,
-                    list(layer.filters.shape),
-                    layer.filters.flatten().tolist()
-                ))
-                initializers.append(helper.make_tensor(
-                    B_name, TensorProto.FLOAT,
-                    list(layer.biases.shape),
-                    layer.biases.flatten().tolist()
-                ))
-                out_name = f'conv{idx}_out'
-                # Crée le noeud Conv
-                nodes.append(helper.make_node(
-                    'Conv',
-                    inputs=[prev_output, W_name, B_name],
-                    outputs=[out_name],
-                    name=f'Conv_{idx}',
-                    pads=[layer.padding]*4 if hasattr(layer, 'padding') else [0,0,0,0],
-                    strides=[layer.stride, layer.stride] if hasattr(layer, 'stride') else [1,1]
-                ))
-                prev_output = out_name
+                output_name = f"conv_{index}_output"
+                weight_name = f"conv_{index}_weights"
+                bias_name = f"conv_{index}_biases"
+                initializers.append(self._onnx_tensor(helper, TensorProto, weight_name, layer.filters))
+                initializers.append(self._onnx_tensor(helper, TensorProto, bias_name, layer.biases.reshape(-1)))
+                nodes.append(
+                    helper.make_node(
+                        "Conv",
+                        inputs=[previous_output, weight_name, bias_name],
+                        outputs=[output_name],
+                        name=f"Conv_{index}",
+                        pads=[layer.padding, layer.padding, layer.padding, layer.padding],
+                        strides=[layer.stride, layer.stride],
+                    )
+                )
+                previous_output = output_name
+                current_shape = [
+                    current_shape[0],
+                    layer.num_filters,
+                    self._onnx_conv_output_dim(current_shape[2], layer.filter_size, layer.padding, layer.stride),
+                    self._onnx_conv_output_dim(current_shape[3], layer.filter_size, layer.padding, layer.stride),
+                ]
+                continue
 
-            # 2.b FCLayer -> Gemm
-            elif isinstance(layer, FCLayer):
-                W_name = f'fc{idx}_W'
-                B_name = f'fc{idx}_B'
-                initializers.append(helper.make_tensor(
-                    W_name, TensorProto.FLOAT,
-                    list(layer.weights.shape),
-                    layer.weights.flatten().tolist()
-                ))
-                initializers.append(helper.make_tensor(
-                    B_name, TensorProto.FLOAT,
-                    list(layer.biases.shape),
-                    layer.biases.flatten().tolist()
-                ))
-                out_name = f'fc{idx}_out'
-                # Gemm: y = alpha * A * B + beta * C (alpha=1, beta=1 par défaut)
-                nodes.append(helper.make_node(
-                    'Gemm',
-                    inputs=[prev_output, W_name, B_name],
-                    outputs=[out_name],
-                    name=f'Gemm_{idx}'
-                ))
-                prev_output = out_name
+            if isinstance(layer, FCLayer):
+                if len(current_shape) != 2:
+                    raise ValueError("FCLayer attend une entree ONNX 2D. Ajoutez FlattenLayer avant FCLayer.")
+                output_name = f"fc_{index}_output"
+                weight_name = f"fc_{index}_weights"
+                bias_name = f"fc_{index}_biases"
+                initializers.append(self._onnx_tensor(helper, TensorProto, weight_name, layer.weights))
+                initializers.append(self._onnx_tensor(helper, TensorProto, bias_name, layer.biases.reshape(-1)))
+                nodes.append(
+                    helper.make_node(
+                        "Gemm",
+                        inputs=[previous_output, weight_name, bias_name],
+                        outputs=[output_name],
+                        name=f"Gemm_{index}",
+                    )
+                )
+                previous_output = output_name
+                current_shape = [current_shape[0], layer.biases.shape[1]]
+                continue
 
-            # 2.c ActivationLayer (séparé)
-            elif isinstance(layer, ActivationLayer):
-                act_fn = layer.activation.__name__.lower()
-                onnx_op = act_map.get(act_fn)
-                if onnx_op is None:
-                    raise ValueError(f"Activation '{act_fn}' non supportée pour ONNX export")
-                act_name = f'act{idx}'
-                nodes.append(helper.make_node(
-                    onnx_op,
-                    inputs=[prev_output],
-                    outputs=[act_name],
-                    name=act_name
-                ))
-                prev_output = act_name
+            if isinstance(layer, ActivationLayer):
+                previous_output = self._append_onnx_activation_node(helper, nodes, layer, previous_output, index)
+                continue
 
-        # 3) Définition de la sortie
-        output_tensor = helper.make_tensor_value_info(prev_output, TensorProto.FLOAT, None)
+            if isinstance(layer, FlattenLayer):
+                if len(current_shape) < 2:
+                    raise ValueError("FlattenLayer attend une entree ONNX avec une dimension batch.")
+                output_name = f"flatten_{index}_output"
+                nodes.append(
+                    helper.make_node(
+                        "Flatten",
+                        inputs=[previous_output],
+                        outputs=[output_name],
+                        name=f"Flatten_{index}",
+                        axis=1,
+                    )
+                )
+                previous_output = output_name
+                current_shape = [current_shape[0], self._onnx_product(current_shape[1:])]
+                continue
 
-        # 4) Construction du graphe et du modèle
+            if isinstance(layer, MaxPooling):
+                if len(current_shape) != 4:
+                    raise ValueError("MaxPooling attend une entree ONNX 4D.")
+                output_name = f"maxpool_{index}_output"
+                nodes.append(
+                    helper.make_node(
+                        "MaxPool",
+                        inputs=[previous_output],
+                        outputs=[output_name],
+                        name=f"MaxPool_{index}",
+                        kernel_shape=[layer.pool_size, layer.pool_size],
+                        strides=[layer.stride, layer.stride],
+                    )
+                )
+                previous_output = output_name
+                current_shape = [
+                    current_shape[0],
+                    current_shape[1],
+                    self._onnx_conv_output_dim(current_shape[2], layer.pool_size, 0, layer.stride),
+                    self._onnx_conv_output_dim(current_shape[3], layer.pool_size, 0, layer.stride),
+                ]
+                continue
+
+            if isinstance(layer, GlobalAvgPool2D):
+                if len(current_shape) != 4:
+                    raise ValueError("GlobalAvgPool2D attend une entree ONNX 4D.")
+                pooled_output = f"global_avg_pool_{index}_output"
+                flattened_output = f"global_avg_pool_{index}_flattened"
+                nodes.append(
+                    helper.make_node(
+                        "GlobalAveragePool",
+                        inputs=[previous_output],
+                        outputs=[pooled_output],
+                        name=f"GlobalAveragePool_{index}",
+                    )
+                )
+                nodes.append(
+                    helper.make_node(
+                        "Flatten",
+                        inputs=[pooled_output],
+                        outputs=[flattened_output],
+                        name=f"GlobalAveragePoolFlatten_{index}",
+                        axis=1,
+                    )
+                )
+                previous_output = flattened_output
+                current_shape = [current_shape[0], current_shape[1]]
+                continue
+
+            if isinstance(layer, BatchNormalization):
+                output_name = f"batchnorm_{index}_output"
+                scale_name = f"batchnorm_{index}_scale"
+                bias_name = f"batchnorm_{index}_bias"
+                mean_name = f"batchnorm_{index}_mean"
+                variance_name = f"batchnorm_{index}_variance"
+                initializers.extend(
+                    [
+                        self._onnx_tensor(helper, TensorProto, scale_name, layer.gamma.reshape(-1)),
+                        self._onnx_tensor(helper, TensorProto, bias_name, layer.beta.reshape(-1)),
+                        self._onnx_tensor(helper, TensorProto, mean_name, layer.running_mean.reshape(-1)),
+                        self._onnx_tensor(helper, TensorProto, variance_name, layer.running_var.reshape(-1)),
+                    ]
+                )
+                nodes.append(
+                    helper.make_node(
+                        "BatchNormalization",
+                        inputs=[previous_output, scale_name, bias_name, mean_name, variance_name],
+                        outputs=[output_name],
+                        name=f"BatchNormalization_{index}",
+                        epsilon=layer.epsilon,
+                        momentum=layer.momentum,
+                    )
+                )
+                previous_output = output_name
+                continue
+
+            if isinstance(layer, Dropout):
+                continue
+
+            if isinstance(layer, Embedding | LSTM):
+                raise NotImplementedError(f"Export ONNX non supporte pour {type(layer).__name__}")
+
+            raise NotImplementedError(f"Export ONNX non supporte pour {type(layer).__name__}")
+
+        output_tensor = helper.make_tensor_value_info(previous_output, TensorProto.FLOAT, self._onnx_shape(current_shape))
         graph = helper.make_graph(
             nodes,
-            'InferenceNetwork',
+            "NumpaiNetwork",
             [input_tensor],
             [output_tensor],
-            initializer=initializers
+            initializer=initializers,
         )
-        model = helper.make_model(graph, producer_name='NetworkONNXExporter')
+        model = helper.make_model(
+            graph,
+            producer_name="numpai",
+            opset_imports=[helper.make_operatorsetid("", 13)],
+        )
+        onnx.checker.check_model(model)
         onnx.save(model, filepath)
+
+    def _append_onnx_activation_node(self, helper, nodes: list, layer: ActivationLayer, previous_output: str, index: int) -> str:
+        activation_name = layer.activation.__name__.lower()
+        output_name = f"activation_{index}_output"
+
+        if activation_name == "relu":
+            nodes.append(helper.make_node("Relu", inputs=[previous_output], outputs=[output_name], name=f"Relu_{index}"))
+            return output_name
+        if activation_name == "tanh":
+            nodes.append(helper.make_node("Tanh", inputs=[previous_output], outputs=[output_name], name=f"Tanh_{index}"))
+            return output_name
+        if activation_name == "sigmoid":
+            nodes.append(helper.make_node("Sigmoid", inputs=[previous_output], outputs=[output_name], name=f"Sigmoid_{index}"))
+            return output_name
+        if activation_name == "leakyrelu":
+            nodes.append(
+                helper.make_node(
+                    "LeakyRelu",
+                    inputs=[previous_output],
+                    outputs=[output_name],
+                    name=f"LeakyRelu_{index}",
+                    alpha=0.01,
+                )
+            )
+            return output_name
+        if activation_name == "softmax":
+            nodes.append(
+                helper.make_node(
+                    "Softmax",
+                    inputs=[previous_output],
+                    outputs=[output_name],
+                    name=f"Softmax_{index}",
+                    axis=-1,
+                )
+            )
+            return output_name
+        if activation_name == "swish":
+            sigmoid_output = f"activation_{index}_sigmoid"
+            nodes.append(
+                helper.make_node(
+                    "Sigmoid",
+                    inputs=[previous_output],
+                    outputs=[sigmoid_output],
+                    name=f"SwishSigmoid_{index}",
+                )
+            )
+            nodes.append(
+                helper.make_node(
+                    "Mul",
+                    inputs=[previous_output, sigmoid_output],
+                    outputs=[output_name],
+                    name=f"SwishMul_{index}",
+                )
+            )
+            return output_name
+
+        raise NotImplementedError(f"Activation non supportee pour ONNX: {activation_name}")
+
+    def _onnx_tensor(self, helper, TensorProto, name: str, value: np.ndarray):
+        tensor = np.asarray(value, dtype=np.float32)
+        return helper.make_tensor(name, TensorProto.FLOAT, list(tensor.shape), tensor.flatten().tolist())
+
+    def _onnx_shape(self, shape: Sequence[int | None]) -> list[int | str]:
+        return [dim if dim is not None else f"dim_{index}" for index, dim in enumerate(shape)]
+
+    def _onnx_product(self, dims: Sequence[int | None]) -> int | None:
+        product = 1
+        for dim in dims:
+            if dim is None:
+                return None
+            product *= dim
+        return product
+
+    def _onnx_conv_output_dim(self, dim: int | None, kernel_size: int, padding: int, stride: int) -> int | None:
+        if dim is None:
+            return None
+        return (dim - kernel_size + 2 * padding) // stride + 1

@@ -13,6 +13,9 @@
 - Easy to understand and use
 
 ## Installation
+```bash
+git clone https://github.com/WhatIsMyRealName/numpai
+```
 
 ## Example Usage
 
